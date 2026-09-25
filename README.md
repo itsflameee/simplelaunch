@@ -1,2 +1,2 @@
 # simplelaunch
-A lightweight CLI tool to detach GUI apps from the terminal, with easy job listing and log viewing for tiling WM users (i3, Hyprland, Sway)
+simplelaunch is a lightweight CLI utility designed to launch GUI applications directly from your terminal completely detached from the current terminal window. It provides an intuitive process list, clean log tracking, and seamless process management. Tailored specifically for users of tiling window managers and Wayland compositors (such as i3wm, Hyprland, Sway, bspwm, or dwm) who skip traditional app launchers and applets in favor of pure, direct terminal access.
