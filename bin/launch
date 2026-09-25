@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+if [ $# -eq 0 ]; then
+    echo "Usage: launch <command> [args...]" >&2
+    exit 1
+fi
+
+USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/simplelaunch"
+SYSTEM_CONFIG_DIR="/etc/simplelaunch"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/simplelaunch"
+TMP_DIR="/tmp/simplelaunch"
+
+CONF_FILE="$USER_CONFIG_DIR/slaunch.conf"
+[ ! -f "$CONF_FILE" ] && [ -f "$SYSTEM_CONFIG_DIR/slaunch.conf" ] && CONF_FILE="$SYSTEM_CONFIG_DIR/slaunch.conf"
+
+EMOJI_FILE="$USER_CONFIG_DIR/emojis.txt"
+[ ! -f "$EMOJI_FILE" ] && [ -f "$SYSTEM_CONFIG_DIR/emojis.txt" ] && EMOJI_FILE="$SYSTEM_CONFIG_DIR/emojis.txt"
+
+REGISTRY_FILE="$DATA_DIR/registry.tsv"
+LOCK_FILE="$DATA_DIR/registry.lock"
+
+logstonull=false
+id_strategy="reuse"
+maximum_ids=50
+emoji_launches=false
+
+mkdir -p "$USER_CONFIG_DIR" "$DATA_DIR"
+
+if [ -f "$CONF_FILE" ]; then
+    while IFS='=' read -r key val; do
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        k=$(echo "$key" | tr -d '[:space:]_')
+        v=$(echo "$val" | tr -d '[:space:]"' | tr -d "'")
+        case "$k" in
+            logstonull)   logstonull="$v" ;;
+            idstrategy)   id_strategy="$v" ;;
+            maximumids)   maximum_ids="$v" ;;
+            emojilaunches) emoji_launches="$v" ;;
+        esac
+    done < "$CONF_FILE"
+fi
+
+get_badge() {
+    local target_id="$1"
+    local raw_val=""
+    if [ -f "$EMOJI_FILE" ]; then
+        raw_val=$(awk -F '=' -v id="$target_id" '$1 ~ "^[[:space:]]*"id"[[:space:]]*$" {print $2; exit}' "$EMOJI_FILE")
+        raw_val=$(echo "$raw_val" | sed -e 's/^[[:space:]]*["'"'"']//' -e 's/["'"'"'][[:space:]]*$//')
+    fi
+    echo "$raw_val"
+}
+
+exec 200>"$LOCK_FILE"
+flock -x 200
+
+touch "$REGISTRY_FILE"
+TMP_REG=$(mktemp)
+while IFS=$'\t' read -r r_id r_pgid r_time r_cmd; do
+    [ -z "$r_id" ] && continue
+    if kill -0 "-$r_pgid" 2>/dev/null; then
+        printf "%s\t%s\t%s\t%s\n" "$r_id" "$r_pgid" "$r_time" "$r_cmd" >> "$TMP_REG"
+    else
+        [ "$logstonull" != "true" ] && rm -f "$TMP_DIR/${r_id}.log"
+    fi
+done < "$REGISTRY_FILE"
+mv "$TMP_REG" "$REGISTRY_FILE"
+
+ASSIGNED_ID=""
+if [ "$id_strategy" = "reuse" ]; then
+    for ((i=1; i<=maximum_ids; i++)); do
+        if ! awk -F '\t' -v check="$i" '$1 == check {found=1} END {exit !found}' "$REGISTRY_FILE"; then
+            ASSIGNED_ID=$i
+            break
+        fi
+    done
+else
+    LAST_ID=$(awk -F '\t' 'BEGIN {max=0} {if ($1>max) max=$1} END {print max}' "$REGISTRY_FILE")
+    NEXT_ID=$((LAST_ID + 1))
+    if [ "$NEXT_ID" -le "$maximum_ids" ]; then
+        ASSIGNED_ID=$NEXT_ID
+    fi
+fi
+
+if [ -z "$ASSIGNED_ID" ]; then
+    echo "simplelaunch: error: reached maximum process limit ($maximum_ids)" >&2
+    flock -u 200
+    exit 1
+fi
+
+if [ "$logstonull" = "true" ]; then
+    LOG_TARGET="/dev/null"
+else
+    mkdir -p "$TMP_DIR"
+    LOG_TARGET="$TMP_DIR/${ASSIGNED_ID}.log"
+    : > "$LOG_TARGET"
+fi
+
+setsid "$@" > "$LOG_TARGET" 2>&1 &
+APP_PID=$!
+sleep 0.05
+APP_PGID=$(ps -o pgid= -p "$APP_PID" 2>/dev/null | tr -d '[:space:]')
+
+if [ -z "$APP_PGID" ] || [ "$APP_PGID" = "0" ]; then
+    APP_PGID=$APP_PID
+fi
+
+START_TIME=$(date +"%H:%M:%S")
+CMD_STR="$*"
+
+printf "%s\t%s\t%s\t%s\n" "$ASSIGNED_ID" "$APP_PGID" "$START_TIME" "$CMD_STR" >> "$REGISTRY_FILE"
+
+flock -u 200
+
+BADGE=""
+if [ "$emoji_launches" = "true" ]; then
+    BADGE=$(get_badge "$ASSIGNED_ID")
+fi
+
+if [ -n "$BADGE" ]; then
+    echo "[$ASSIGNED_ID / $BADGE] Started '$*'"
+else
+    echo "[$ASSIGNED_ID] Started '$*'"
+fi

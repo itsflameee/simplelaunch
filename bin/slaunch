@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+
+USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/simplelaunch"
+SYSTEM_CONFIG_DIR="/etc/simplelaunch"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/simplelaunch"
+TMP_DIR="/tmp/simplelaunch"
+
+CONF_FILE="$USER_CONFIG_DIR/slaunch.conf"
+[ ! -f "$CONF_FILE" ] && [ -f "$SYSTEM_CONFIG_DIR/slaunch.conf" ] && CONF_FILE="$SYSTEM_CONFIG_DIR/slaunch.conf"
+
+EMOJI_FILE="$USER_CONFIG_DIR/emojis.txt"
+[ ! -f "$EMOJI_FILE" ] && [ -f "$SYSTEM_CONFIG_DIR/emojis.txt" ] && EMOJI_FILE="$SYSTEM_CONFIG_DIR/emojis.txt"
+
+REGISTRY_FILE="$DATA_DIR/registry.tsv"
+LOCK_FILE="$DATA_DIR/registry.lock"
+
+emoji_launches=false
+if [ -f "$CONF_FILE" ]; then
+    while IFS='=' read -r key val; do
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        k=$(echo "$key" | tr -d '[:space:]_')
+        v=$(echo "$val" | tr -d '[:space:]"' | tr -d "'")
+        [ "$k" = "emojilaunches" ] && emoji_launches="$v"
+    done < "$CONF_FILE"
+fi
+
+mkdir -p "$DATA_DIR"
+touch "$REGISTRY_FILE"
+
+get_badge() {
+    local target_id="$1"
+    local raw_val=""
+    if [ -f "$EMOJI_FILE" ]; then
+        raw_val=$(awk -F '=' -v id="$target_id" '$1 ~ "^[[:space:]]*"id"[[:space:]]*$" {print $2; exit}' "$EMOJI_FILE")
+        raw_val=$(echo "$raw_val" | sed -e 's/^[[:space:]]*["'"'"']//' -e 's/["'"'"'][[:space:]]*$//')
+    fi
+    echo "$raw_val"
+}
+
+resolve_id() {
+    local query="$1"
+    if [[ "$query" =~ ^[0-9]+$ ]]; then
+        echo "$query"
+        return
+    fi
+    if [ -f "$EMOJI_FILE" ]; then
+        local found_id
+        found_id=$(awk -F '=' -v val="$query" '
+            {
+                clean_val = $2
+                sub(/^[[:space:]]*["'"'"']/, "", clean_val)
+                sub(/["'"'"'][[:space:]]*$/, "", clean_val)
+                clean_key = $1
+                gsub(/[[:space:]]/, "", clean_key)
+                if (clean_val == val) { print clean_key; exit }
+            }
+        ' "$EMOJI_FILE")
+        if [ -n "$found_id" ]; then
+            echo "$found_id"
+            return
+        fi
+    fi
+    echo "$query"
+}
+
+clean_registry() {
+    exec 200>"$LOCK_FILE"
+    flock -x 200
+    local tmp_reg
+    tmp_reg=$(mktemp)
+    while IFS=$'\t' read -r r_id r_pgid r_time r_cmd; do
+        [ -z "$r_id" ] && continue
+        if kill -0 "-$r_pgid" 2>/dev/null; then
+            printf "%s\t%s\t%s\t%s\n" "$r_id" "$r_pgid" "$r_time" "$r_cmd" >> "$tmp_reg"
+        else
+            rm -f "$TMP_DIR/${r_id}.log"
+        fi
+    done < "$REGISTRY_FILE"
+    mv "$tmp_reg" "$REGISTRY_FILE"
+    flock -u 200
+}
+
+show_list() {
+    clean_registry
+    if [ ! -s "$REGISTRY_FILE" ]; then
+        echo "No active processes."
+        return
+    fi
+
+    if [ "$emoji_launches" = "true" ]; then
+        printf "%-10s %-10s %s\n" "ID" "TIME" "COMMAND"
+        printf "%-10s %-10s %s\n" "----------" "----------" "--------------------"
+        while IFS=$'\t' read -r r_id r_pgid r_time r_cmd; do
+            local badge
+            badge=$(get_badge "$r_id")
+            local id_display="$r_id"
+            [ -n "$badge" ] && id_display="$r_id / $badge"
+            printf "%-10s %-10s %s\n" "$id_display" "$r_time" "$r_cmd"
+        done < "$REGISTRY_FILE"
+    else
+        printf "%-6s %-10s %s\n" "ID" "TIME" "COMMAND"
+        printf "%-6s %-10s %s\n" "------" "----------" "--------------------"
+        while IFS=$'\t' read -r r_id r_pgid r_time r_cmd; do
+            printf "%-6s %-10s %s\n" "$r_id" "$r_time" "$r_cmd"
+        done < "$REGISTRY_FILE"
+    fi
+}
+
+kill_process() {
+    local target="$1"
+    local num_id
+    num_id=$(resolve_id "$target")
+
+    clean_registry
+
+    local row
+    row=$(awk -F '\t' -v id="$num_id" '$1 == id {print $0; exit}' "$REGISTRY_FILE")
+
+    if [ -z "$row" ]; then
+        echo "simplelaunch: no process found matching '$target'" >&2
+        exit 1
+    fi
+
+    local pgid cmd
+    pgid=$(echo "$row" | cut -f2)
+    cmd=$(echo "$row" | cut -f4)
+
+    kill -TERM -- "-$pgid" 2>/dev/null || kill -KILL -- "-$pgid" 2>/dev/null
+
+    local badge=""
+    [ "$emoji_launches" = "true" ] && badge=$(get_badge "$num_id")
+
+    if [ -n "$badge" ]; then
+        echo "Killed [$num_id / $badge] '$cmd'"
+    else
+        echo "Killed [$num_id] '$cmd'"
+    fi
+
+    clean_registry
+}
+
+read_logs() {
+    local target="$1"
+    local follow="$2"
+    local num_id
+    num_id=$(resolve_id "$target")
+
+    local log_path="$TMP_DIR/${num_id}.log"
+
+    if [ ! -f "$log_path" ]; then
+        echo "simplelaunch: no log file found for ID '$num_id' (logstonull might be active or process never ran)" >&2
+        exit 1
+    fi
+
+    if [ "$follow" = "true" ]; then
+        tail -f "$log_path"
+    else
+        cat "$log_path"
+    fi
+}
+
+case "$1" in
+    -l|--list)
+        show_list
+        ;;
+    -k|--kill)
+        [ -z "$2" ] && { echo "Usage: slaunch -k <ID|emoji>" >&2; exit 1; }
+        kill_process "$2"
+        ;;
+    -L|--logs)
+        [ -z "$2" ] && { echo "Usage: slaunch -L <ID|emoji>" >&2; exit 1; }
+        read_logs "$2" false
+        ;;
+    -f|--follow)
+        [ -z "$2" ] && { echo "Usage: slaunch -f <ID|emoji>" >&2; exit 1; }
+        read_logs "$2" true
+        ;;
+    *)
+        echo "Usage: slaunch [options]"
+        echo "Options:"
+        echo "  -l, --list             List all active processes"
+        echo "  -k, --kill <ID|emoji>  Terminate process and all child processes by PGID"
+        echo "  -L, --logs <ID|emoji>  Print process log file"
+        echo "  -f, --follow <ID|emoji> Stream process logs in real-time"
+        exit 1
+        ;;
+esac
